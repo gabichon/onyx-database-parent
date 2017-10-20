@@ -22,16 +22,22 @@ class DefaultAuthenticationManager(private val persistenceManager: PersistenceMa
      * @since 1.2.0
      */
     @Throws(InitializationException::class)
-    override fun verify(username: String, password: String) {
+    override fun verify(username: String?, password: String?) {
+        if (username == null || password == null)
+            throw InitializationException(InitializationException.INVALID_CREDENTIALS)
+
         val user: SystemUser?
         try {
             user = persistenceManager.findById(SystemUser::class.java, username)
         } catch (e: OnyxException) {
             throw InitializationException(InitializationException.UNKNOWN_EXCEPTION, e)
+        } catch (e: NullPointerException) {
+            throw InitializationException(InitializationException.INVALID_CREDENTIALS)
         }
 
         if (user == null)
             throw InitializationException(InitializationException.INVALID_CREDENTIALS)
+
         if (user.password != encryption.encrypt(password))
             throw InitializationException(InitializationException.INVALID_CREDENTIALS)
     }

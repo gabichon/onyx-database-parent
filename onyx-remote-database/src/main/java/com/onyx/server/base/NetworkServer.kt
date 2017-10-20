@@ -9,6 +9,7 @@ import com.onyx.client.base.engine.PacketTransportEngine
 import com.onyx.client.base.engine.impl.SecurePacketTransportEngine
 import com.onyx.client.base.engine.impl.UnsecuredPacketTransportEngine
 import com.onyx.client.connection.ConnectionFactory
+import com.onyx.client.connection.UnifiedMessageChannel
 import com.onyx.client.exception.MethodInvocationException
 import com.onyx.client.exception.ServerClosedException
 import com.onyx.client.handlers.RequestHandler
@@ -28,6 +29,8 @@ import java.net.InetSocketAddress
 import java.nio.channels.*
 import java.nio.channels.spi.SelectorProvider
 import java.util.HashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -75,8 +78,9 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
         }
 
         active = true
-        startWriteQueue()
         startReadQueue()
+        startWriteQueue()
+        startConnectionService()
     }
 
     /**
@@ -86,8 +90,9 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
      */
     override fun stop() {
         active = false
-        stopReadQueue()
+        stopConnectionService()
         stopWriteQueue()
+        stopReadQueue()
         selector?.wakeup()
         serverSocketChannel?.socket()?.close()
         serverSocketChannel?.close()
@@ -100,7 +105,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
      */
     override fun join() {
         runBlocking {
-            readJob?.join()
+            connectionJob?.join()
         }
     }
 
@@ -115,7 +120,9 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
 
     // endregion
 
-    // region Read Job
+    // region Jobs
+
+    private var connectionJob:Job? = null
 
     /**
      * Poll the server connections for inbound communication
@@ -124,8 +131,8 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
      * @since 1.2.0
      */
     @Throws(ServerClosedException::class)
-    override fun startReadQueue() {
-        readJob = runJob("Server Read Job") {
+    private fun startConnectionService() {
+        connectionJob = runJob("Server Connection Job") {
             while (active) {
                 try { selector?.select() } catch (e: IOException) { throw ServerClosedException(e) }
 
@@ -138,12 +145,21 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
                     when {
                         !key.isValid || !key.channel().isOpen -> closeConnection(key.channel() as SocketChannel, key.attachment() as Connection)
                         key.isAcceptable -> try { accept(key) } catch (any: Exception) { closeConnection(key.channel() as SocketChannel, key.attachment() as Connection) }
-                        key.isReadable -> { read(key.channel() as SocketChannel, key.attachment() as Connection) }
+                        key.isReadable -> {
+                            val connection = key.attachment() as Connection
+                            connection.messageChannel.readChannel.send {
+                                read(key.channel() as SocketChannel, connection)
+                            }
+                        }
                     }
                 }
+
+                delay(500, TimeUnit.MICROSECONDS)
             }
         }
     }
+
+    private fun stopConnectionService():Boolean? = connectionJob?.cancel()
 
     // endregion
 
@@ -303,7 +319,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
         NetworkBufferPool.init(transportPacketTransportEngine.packetSize)
 
         // Send the buffer pool into the connectionProperties so that they may retain its references
-        val connectionProperties = ConnectionFactory.create(transportPacketTransportEngine)
+        val connectionProperties = ConnectionFactory.create(transportPacketTransportEngine, newChannel())
 
         // Perform handshake.  If this is secure SSL, this does something otherwise, it is just pass through
         if (doHandshake(socketChannel, connectionProperties)) {
@@ -325,6 +341,60 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
      * @since 1.2.0
      */
     override fun setCredentials(user: String, password: String) {}
+
+
+    /**
+     * Start write queue.  Currently there is only a single write i/o thread.  This does nothing other than
+     * write a message to a socket.  The queue is a non blocking channel kinda like a BlockingQueue.  This
+     * will start a daemon thread waiting for queue entries.
+     *
+     * @since 2.0.0
+     */
+    override fun startWriteQueue() {
+        messageChannels.forEach {
+            writeJobs.add(runJob("Server Write Job") {
+                while (active) {
+                    it.writeChannel.receive().invoke()
+                }
+            })
+        }
+    }
+
+    /**
+     * Start read queue.  This is to be overridden by extending class.  A client may want to implement a blocking queue
+     * and a server would be a selection key.  That is why this is abstract.  The only requiement is that the daemon
+     * is started and assigns the readJob.
+     *
+     * @since 2.0.0
+     */
+    override fun startReadQueue() {
+        messageChannels.forEach {
+            readJobs.add(runJob("Server Read Job") {
+                while (active) {
+                    it.readChannel.receive().invoke()
+                }
+            })
+        }
+    }
+
+
+    private val roundRobinCounter = AtomicInteger()
+
+    private val messageChannels:List<UnifiedMessageChannel> by lazy {
+        val list = ArrayList<UnifiedMessageChannel>()
+        for (i in 0..Runtime.getRuntime().availableProcessors()) { list.add(UnifiedMessageChannel()) }
+        return@lazy list
+    }
+
+    @Synchronized
+    private fun newChannel(): UnifiedMessageChannel {
+        if(roundRobinCounter.get() >= Runtime.getRuntime().availableProcessors())
+            roundRobinCounter.set(0)
+        return messageChannels[roundRobinCounter.getAndIncrement()]
+    }
+
+
+
 
     companion object {
         val REMOVE_SUBSCRIBER_EVENT = 1.toByte()

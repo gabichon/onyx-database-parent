@@ -13,7 +13,6 @@ class Message(var messageId:Short = 0) {
     val packets:MutableList<Packet> = ArrayList()
 
     companion object {
-        val PACKET_METADATA_SIZE = java.lang.Short.BYTES * 2
         val MESSAGE_METADATA_SIZE = java.lang.Short.BYTES
     }
 }
@@ -25,7 +24,7 @@ fun ByteBuffer.toMessage(request: RequestToken) : Message {
         // Divide the buffer into individual packets
         while (this.hasRemaining()) {
             val packetBuffer = NetworkBufferPool.allocate()
-            packetBuffer.position(if(message.packets.isEmpty()) (Message.PACKET_METADATA_SIZE + Message.MESSAGE_METADATA_SIZE) else Message.PACKET_METADATA_SIZE)
+            packetBuffer.position(if(message.packets.isEmpty()) (Packet.PACKET_METADATA_SIZE + Message.MESSAGE_METADATA_SIZE) else Packet.PACKET_METADATA_SIZE)
 
             while (this.hasRemaining() && packetBuffer.hasRemaining())
                 packetBuffer.put(this.get())
@@ -41,7 +40,7 @@ fun ByteBuffer.toMessage(request: RequestToken) : Message {
         // Update the number of packets
         message.numberOfPackets = message.packets.size.toShort() // Add 1 for the message metadata packet
         val firstPacket = message.packets.first()
-        firstPacket.packetBuffer.position(Message.PACKET_METADATA_SIZE)
+        firstPacket.packetBuffer.position(Packet.PACKET_METADATA_SIZE)
         firstPacket.packetBuffer.putShort(message.numberOfPackets)
         firstPacket.packetBuffer.rewind()
 
@@ -53,7 +52,7 @@ fun Message.toByteBuffer():ByteBuffer {
     val messageBuffer = BufferPool.allocateAndLimit(this.packets.size * NetworkBufferPool.bufferSize)
     this.packets.forEachIndexed { index, packet ->
         NetworkBufferPool.withBuffer(packet.packetBuffer) {
-            it.position(if(index == 0) (Message.PACKET_METADATA_SIZE + Message.MESSAGE_METADATA_SIZE) else Message.PACKET_METADATA_SIZE)
+            it.position(if(index == 0) (Packet.PACKET_METADATA_SIZE + Message.MESSAGE_METADATA_SIZE) else Packet.PACKET_METADATA_SIZE)
             messageBuffer.put(it)
         }
     }

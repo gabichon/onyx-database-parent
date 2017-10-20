@@ -89,17 +89,13 @@ public class HashIndexConcurrencyTest extends RemoteBaseTest {
             {
                 List<IManagedEntity> tmpList = new ArrayList<IManagedEntity>(entities);
                 entities.removeAll(entities);
-                Runnable runnable = new Runnable() {
-                    @Override
-                    public void run()
+                Runnable runnable = () -> {
+                    try
                     {
-                        try
-                        {
-                            manager.saveEntities(tmpList);
-                        } catch (OnyxException e)
-                        {
-                            e.printStackTrace();
-                        }
+                        manager.saveEntities(tmpList);
+                    } catch (OnyxException e)
+                    {
+                        e.printStackTrace();
                     }
                 };
                 threads.add(pool.submit(runnable));

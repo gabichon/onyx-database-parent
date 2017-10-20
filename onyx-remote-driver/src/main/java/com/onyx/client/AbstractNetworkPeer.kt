@@ -11,7 +11,7 @@ import com.onyx.extension.common.async
 import com.onyx.extension.common.catchAll
 import com.onyx.extension.common.runJob
 import kotlinx.coroutines.experimental.Job
-import kotlinx.coroutines.experimental.channels.Channel
+import kotlinx.coroutines.experimental.disposeOnCompletion
 
 import javax.net.ssl.SSLEngineResult
 import javax.net.ssl.SSLEngineResult.HandshakeStatus
@@ -46,26 +46,17 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
 
     // region Jobs
 
-    private var writeQueue:Channel<() -> Unit>? = null
-    private var writeJob:Job? = null
-    private var readQueue:Channel<() -> Unit> = Channel()
-    protected var readJob:Job? = null
+    protected var writeJobs = ArrayList<Job>()
+    protected var readJobs = ArrayList<Job>()
+
+    abstract fun startReadQueue()
 
     /**
-     * Start write queue.  Currently there is only a single write i/o thread.  This does nothing other than
-     * write a message to a socket.  The queue is a non blocking channel kinda like a BlockingQueue.  This
-     * will start a daemon thread waiting for queue entries.
+     * Poll for communication responses from the server
      *
-     * @since 2.0.0
+     * @since 1.2.0
      */
-    protected fun startWriteQueue() {
-        writeQueue = Channel()
-        writeJob = runJob("Network Write Job") {
-            while (active) {
-                writeQueue?.receive()?.invoke()
-            }
-        }
-    }
+    abstract fun startWriteQueue()
 
     /**
      * Kill the write daemon.
@@ -73,27 +64,14 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
      * @since 2.0.0
      */
     protected fun stopWriteQueue() {
-        catchAll { writeQueue?.close() }
-        catchAll { writeJob?.cancel() }
-        writeJob = null
-        writeQueue = null
+        catchAll { writeJobs.forEach { it.cancel(); }; writeJobs.clear() }
     }
-
-    /**
-     * Start read queue.  This is to be overridden by extending class.  A client may want to implement a blocking queue
-     * and a server would be a selection key.  That is why this is abstract.  The only requiement is that the daemon
-     * is started and assigns the readJob.
-     *
-     * @since 2.0.0
-     */
-    abstract protected fun startReadQueue()
 
     /**
      * Stop the read daemon.
      */
     protected fun stopReadQueue() {
-        catchAll { readJob?.cancel() }
-        readJob = null
+        catchAll { readJobs.forEach { it.cancel() }; readJobs.clear() }
     }
 
     // endregion
@@ -116,7 +94,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
             val bytesRead = socketChannel.read(connection.readNetworkData)
             when {
                 bytesRead < 0 -> { closeConnection(socketChannel, connection); read@return }
-                bytesRead > Message.PACKET_METADATA_SIZE -> {
+                bytesRead > Packet.PACKET_METADATA_SIZE -> {
                     connection.readNetworkData.flip()
 
                     loop@ while (socketChannel.isConnected && socketChannel.isOpen && bytesRead > 0) {
@@ -201,7 +179,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
             val buffer = serverSerializer.serialize(request, ByteBuffer.allocate(BufferPool.MEDIUM_BUFFER_SIZE))
             val message = buffer.toMessage(request)
 
-            writeQueue?.send {
+            connection.messageChannel.writeChannel.send {
                 if(socketChannel.isConnected && socketChannel.isOpen) {
                     message.packets.forEach {
                         writePacket(socketChannel, connection, it.packetBuffer)

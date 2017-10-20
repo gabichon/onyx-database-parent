@@ -6,6 +6,8 @@ import com.onyx.client.base.engine.PacketTransportEngine
 
 object ConnectionFactory {
 
+
+
     @Synchronized
     fun recycle(buffer: Connection) {
         buffer.messages.forEach { it.value.packets.forEach { NetworkBufferPool.recycle(it.packetBuffer) } }
@@ -13,6 +15,7 @@ object ConnectionFactory {
     }
 
     @Synchronized
-    fun create(engine: PacketTransportEngine): Connection = Connection(engine)
+    fun create(engine: PacketTransportEngine, channel: UnifiedMessageChannel = UnifiedMessageChannel()): Connection = Connection(engine, channel)
+
 }
 

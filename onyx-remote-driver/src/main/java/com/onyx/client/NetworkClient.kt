@@ -169,8 +169,9 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
         needsToRunHeartbeat = false
         pendingRequests.clear()
         heartBeatJob?.cancel()
-        stopReadQueue()
         stopWriteQueue()
+        stopReadQueue()
+        connection?.messageChannel?.close()
     }
 
     /**
@@ -191,15 +192,32 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
     /**
      * Poll for communication responses from the server
      *
-     * @since 2.0.0 Refactored as a Job
+     * @since 1.2.0
      */
     override fun startReadQueue() {
-        readJob = runJob("Client Read Job") {
-            while (active) {
-                catchAll {
-                    read(socketChannel!!, connection!!)
+        if(readJobs.isEmpty()) {
+            readJobs.add(runJob("Client Read Job") {
+                while (isConnected) {
+                    catchAll {
+                        read(socketChannel!!, connection!!)
+                    }
                 }
-            }
+            })
+        }
+    }
+
+    /**
+     * Poll for communication responses from the server
+     *
+     * @since 1.2.0
+     */
+    override fun startWriteQueue() {
+        if(writeJobs.isEmpty()) {
+            writeJobs.add(runJob("Client Write Job") {
+                while (isConnected) {
+                    connection!!.messageChannel.writeChannel.receive().invoke()
+                }
+            })
         }
     }
 
@@ -367,10 +385,12 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
      * @since 1.2.0
      */
     private fun resumeHeartBeat() {
-        heartBeatJob = runJob("Client Heart Beat Job") {
-            while (true) {
-                runHeartBeat()
-                delay(HEART_BEAT_INTERVAL, TimeUnit.SECONDS)
+        if(heartBeatJob == null) {
+            heartBeatJob = runJob("Client Heart Beat Job") {
+                while (true) {
+                    runHeartBeat()
+                    delay(HEART_BEAT_INTERVAL, TimeUnit.SECONDS)
+                }
             }
         }
     }

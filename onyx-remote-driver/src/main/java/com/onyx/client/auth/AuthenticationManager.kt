@@ -16,5 +16,5 @@ interface AuthenticationManager {
      * @param password Password
      */
     @Throws(InitializationException::class, RequestTimeoutException::class)
-    fun verify(username: String, password: String)
+    fun verify(username: String?, password: String?)
 }

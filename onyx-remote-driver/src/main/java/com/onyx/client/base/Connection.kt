@@ -4,6 +4,7 @@ import com.onyx.buffer.BufferPool
 import com.onyx.buffer.NetworkBufferPool
 import com.onyx.client.Message
 import com.onyx.client.base.engine.PacketTransportEngine
+import com.onyx.client.connection.UnifiedMessageChannel
 import java.nio.ByteBuffer
 
 /**
@@ -16,6 +17,7 @@ import java.nio.ByteBuffer
 class Connection(
 
         var packetTransportEngine: PacketTransportEngine,
+        var messageChannel: UnifiedMessageChannel,
         var writeNetworkData: ByteBuffer = BufferPool.allocateAndLimit(NetworkBufferPool.bufferSize),
         var readNetworkData: ByteBuffer = BufferPool.allocateAndLimit(NetworkBufferPool.bufferSize)) {
 
