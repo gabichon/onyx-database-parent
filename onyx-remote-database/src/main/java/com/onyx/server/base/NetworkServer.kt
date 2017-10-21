@@ -1,6 +1,7 @@
 package com.onyx.server.base
 
 import com.onyx.application.OnyxServer
+import com.onyx.buffer.BufferPool
 import com.onyx.buffer.NetworkBufferPool
 import com.onyx.client.AbstractNetworkPeer
 import com.onyx.client.Message
@@ -17,7 +18,9 @@ import com.onyx.client.push.PushSubscriber
 import com.onyx.client.push.PushPublisher
 import com.onyx.client.toRequest
 import com.onyx.exception.InitializationException
+import com.onyx.extension.common.catchAll
 import com.onyx.extension.common.runJob
+import com.onyx.extension.withBuffer
 import com.onyx.interactors.encryption.impl.DefaultEncryptionInteractor
 import com.onyx.interactors.encryption.EncryptionInteractor
 import com.onyx.lang.map.OptimisticLockingMap
@@ -26,9 +29,11 @@ import kotlinx.coroutines.experimental.*
 import javax.net.ssl.SSLContext
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.nio.ByteBuffer
 import java.nio.channels.*
 import java.nio.channels.spi.SelectorProvider
 import java.util.HashMap
+import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -58,6 +63,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
     private var sslContext: SSLContext? = null // SSL Context if used.  Otherwise this will be null
     private var selector: Selector? = null // Selector for inbound communication
     private var serverSocketChannel: ServerSocketChannel? = null
+    private val connections:MutableList<Connection> = ArrayList()
 
     // region Start / Stop Lifecycle
 
@@ -78,7 +84,6 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
         }
 
         active = true
-        startReadQueue()
         startWriteQueue()
         startConnectionService()
     }
@@ -92,7 +97,6 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
         active = false
         stopConnectionService()
         stopWriteQueue()
-        stopReadQueue()
         selector?.wakeup()
         serverSocketChannel?.socket()?.close()
         serverSocketChannel?.close()
@@ -143,18 +147,15 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
                     val key = selectedKeys.next()
                     selectedKeys.remove()
                     when {
-                        !key.isValid || !key.channel().isOpen -> closeConnection(key.channel() as SocketChannel, key.attachment() as Connection)
-                        key.isAcceptable -> try { accept(key) } catch (any: Exception) { closeConnection(key.channel() as SocketChannel, key.attachment() as Connection) }
+                        !key.isValid || !key.channel().isOpen -> closeConnection(key.attachment() as Connection)
+                        key.isAcceptable -> try { accept(key) } catch (any: Exception) { closeConnection(key.attachment() as Connection) }
                         key.isReadable -> {
-                            val connection = key.attachment() as Connection
-                            connection.messageChannel.readChannel.send {
-                                read(key.channel() as SocketChannel, connection)
-                            }
+                            read(key.channel() as SocketChannel, key.attachment() as Connection)
                         }
                     }
                 }
 
-                delay(500, TimeUnit.MICROSECONDS)
+                delay(100, TimeUnit.MILLISECONDS)
             }
         }
     }
@@ -188,7 +189,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
                         MethodInvocationException(MethodInvocationException.UNHANDLED_EXCEPTION, e)
                     }
 
-                    write(socketChannel, connection, this)
+                    write(connection, this)
                 }
             }
         }
@@ -249,7 +250,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
             pushSubscribers.remove(subscriber)
         }
 
-        write(socketChannel, connection, message)
+        write(connection, message)
     }
 
     /**
@@ -263,7 +264,7 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
     override fun push(pushSubscriber: PushSubscriber, packet: Any) {
         if (pushSubscriber.channel.isOpen && pushSubscriber.channel.isConnected) {
             pushSubscriber.packet = packet
-            write(pushSubscriber.channel, pushSubscriber.connection, RequestToken(PUSH_NOTIFICATION, pushSubscriber))
+            write(pushSubscriber.connection, RequestToken(PUSH_NOTIFICATION, pushSubscriber))
         } else {
             deRegisterSubscriberIdentity(pushSubscriber) // Clean up non connected subscribers if not connected
         }
@@ -319,14 +320,21 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
         NetworkBufferPool.init(transportPacketTransportEngine.packetSize)
 
         // Send the buffer pool into the connectionProperties so that they may retain its references
-        val connectionProperties = ConnectionFactory.create(transportPacketTransportEngine, newChannel())
+        val connection = ConnectionFactory.create(socketChannel, transportPacketTransportEngine, UnifiedMessageChannel())
+
+        connections.add(connection)
 
         // Perform handshake.  If this is secure SSL, this does something otherwise, it is just pass through
-        if (doHandshake(socketChannel, connectionProperties)) {
-            socketChannel.register(selector, SelectionKey.OP_READ, connectionProperties)
+        if (doHandshake(socketChannel, connection)) {
+            socketChannel.register(selector, SelectionKey.OP_READ, connection)
         } else {
-            closeConnection(socketChannel, connectionProperties)
+            closeConnection(connection)
         }
+    }
+
+    override fun closeConnection(connection: Connection) {
+        super.closeConnection(connection)
+        connections.remove(connection)
     }
 
     // endregion
@@ -351,49 +359,15 @@ open class NetworkServer : AbstractNetworkPeer(), OnyxServer, PushPublisher {
      * @since 2.0.0
      */
     override fun startWriteQueue() {
-        messageChannels.forEach {
-            writeJobs.add(runJob("Server Write Job") {
-                while (active) {
-                    it.writeChannel.receive().invoke()
+        writeJob = runJob("Server Write Job") {
+            while (active) {
+                connections.forEach { connection ->
+                    writeConnectionData(connection)
                 }
-            })
+                delay(10, TimeUnit.MILLISECONDS)
+            }
         }
     }
-
-    /**
-     * Start read queue.  This is to be overridden by extending class.  A client may want to implement a blocking queue
-     * and a server would be a selection key.  That is why this is abstract.  The only requiement is that the daemon
-     * is started and assigns the readJob.
-     *
-     * @since 2.0.0
-     */
-    override fun startReadQueue() {
-        messageChannels.forEach {
-            readJobs.add(runJob("Server Read Job") {
-                while (active) {
-                    it.readChannel.receive().invoke()
-                }
-            })
-        }
-    }
-
-
-    private val roundRobinCounter = AtomicInteger()
-
-    private val messageChannels:List<UnifiedMessageChannel> by lazy {
-        val list = ArrayList<UnifiedMessageChannel>()
-        for (i in 0..Runtime.getRuntime().availableProcessors()) { list.add(UnifiedMessageChannel()) }
-        return@lazy list
-    }
-
-    @Synchronized
-    private fun newChannel(): UnifiedMessageChannel {
-        if(roundRobinCounter.get() >= Runtime.getRuntime().availableProcessors())
-            roundRobinCounter.set(0)
-        return messageChannels[roundRobinCounter.getAndIncrement()]
-    }
-
-
 
 
     companion object {

@@ -40,11 +40,11 @@ class RMITest {
 
 
         val message = ByteArray(2048)
-        val countDownLatch = CountDownLatch(10000000)
+        val countDownLatch = CountDownLatch(1000000)
         val startTime = System.currentTimeMillis()
         val context = newFixedThreadPoolContext(16, "iduno")
 
-        for (i in 0..10000000) {
+        for (i in 0..1000000) {
             async(context) {
                 try {
                     messanger.captureMessage(message)

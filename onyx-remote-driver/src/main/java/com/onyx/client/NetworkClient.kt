@@ -114,24 +114,24 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
         try {
             socketChannel = SocketChannel.open()
             socketChannel!!.socket().keepAlive = true
-            socketChannel!!.socket().tcpNoDelay = true
+            socketChannel!!.socket().tcpNoDelay = false
             socketChannel!!.socket().reuseAddress = true
         } catch (e: IOException) {
             throw ConnectionFailedException()
         }
 
         // Create a buffer and set the transport wrapper
-        this.connection = ConnectionFactory.create(transportPacketTransportEngine)
+        this.connection = ConnectionFactory.create(socketChannel!!, transportPacketTransportEngine)
 
         if (transportPacketTransportEngine is UnsecuredPacketTransportEngine) {
             transportPacketTransportEngine.setSocketChannel(socketChannel)
         }
 
         try {
-            socketChannel?.configureBlocking(true)
             socketChannel?.socket()?.connect(InetSocketAddress(host, port), connectTimeout * 1000)
             while (!socketChannel!!.finishConnect())
                 runBlocking { delay(10, TimeUnit.MILLISECONDS) }
+            socketChannel?.configureBlocking(false)
         } catch (e: IOException) {
             throw ConnectionFailedException()
         }
@@ -145,7 +145,7 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
         }
 
         startWriteQueue()
-        startReadQueue()
+        startConnectionService()
 
         try {
             this.authenticationManager?.verify(this.user, this.password)
@@ -165,12 +165,12 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
      */
     override fun close() {
         active = false
-        closeConnection(socketChannel!!, connection!!)
+        closeConnection(connection!!)
         needsToRunHeartbeat = false
         pendingRequests.clear()
         heartBeatJob?.cancel()
+        stopConnectionService()
         stopWriteQueue()
-        stopReadQueue()
         connection?.messageChannel?.close()
     }
 
@@ -189,21 +189,25 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
 
     // region Jobs
 
+    private var connectionJob:Job? = null
     /**
      * Poll for communication responses from the server
      *
      * @since 1.2.0
      */
-    override fun startReadQueue() {
-        if(readJobs.isEmpty()) {
-            readJobs.add(runJob("Client Read Job") {
-                while (isConnected) {
-                    catchAll {
-                        read(socketChannel!!, connection!!)
-                    }
+    private fun startConnectionService() {
+        connectionJob = runJob("Client Read Job") {
+            while (isConnected) {
+                catchAll {
+                    read(socketChannel!!, connection!!)
                 }
-            })
+                delay(20, TimeUnit.MILLISECONDS)
+            }
         }
+    }
+
+    private fun stopConnectionService() {
+        catchAll { connectionJob?.cancel() }
     }
 
     /**
@@ -212,12 +216,15 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
      * @since 1.2.0
      */
     override fun startWriteQueue() {
-        if(writeJobs.isEmpty()) {
-            writeJobs.add(runJob("Client Write Job") {
-                while (isConnected) {
-                    connection!!.messageChannel.writeChannel.receive().invoke()
+        writeJob = runJob("Client Write Job") {
+            while(isConnected) {
+                try {
+                    writeConnectionData(connection!!)
+                } catch (e:Exception) {
+                    e.printStackTrace()
                 }
-            })
+                delay(20, TimeUnit.MILLISECONDS)
+            }
         }
     }
 
@@ -252,7 +259,7 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
         pendingRequests.put(token, deferredValue)
 
         try {
-            write(socketChannel!!, connection!!, token)
+            write(connection!!, token)
             return runBlocking {
                 withTimeout(timeout.toLong()) {
                     deferredValue.await()
@@ -421,7 +428,7 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
             try {
 
                 // Heartbeat failed, try to re-connect
-                closeConnection(socketChannel!!, connection!!)
+                closeConnection(connection!!)
                 connect(host, port)
 
                 if (active
@@ -437,7 +444,7 @@ open class NetworkClient : AbstractNetworkPeer(), OnyxClient, PushRegistrar {
                     pendingRequests.forEach { requestToken, _ ->
                         // Ignore heartbeat packets
                         if (requestToken.packet != null) {
-                            write(socketChannel!!, connection!!, requestToken)
+                            write(connection!!, requestToken)
                         }
                     }
                 }

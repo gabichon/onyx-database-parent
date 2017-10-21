@@ -9,9 +9,8 @@ import com.onyx.client.serialization.DefaultServerSerializer
 import com.onyx.client.serialization.ServerSerializer
 import com.onyx.extension.common.async
 import com.onyx.extension.common.catchAll
-import com.onyx.extension.common.runJob
+import com.onyx.extension.withBuffer
 import kotlinx.coroutines.experimental.Job
-import kotlinx.coroutines.experimental.disposeOnCompletion
 
 import javax.net.ssl.SSLEngineResult
 import javax.net.ssl.SSLEngineResult.HandshakeStatus
@@ -46,10 +45,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
 
     // region Jobs
 
-    protected var writeJobs = ArrayList<Job>()
-    protected var readJobs = ArrayList<Job>()
-
-    abstract fun startReadQueue()
+    protected var writeJob:Job? = null
 
     /**
      * Poll for communication responses from the server
@@ -64,14 +60,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
      * @since 2.0.0
      */
     protected fun stopWriteQueue() {
-        catchAll { writeJobs.forEach { it.cancel(); }; writeJobs.clear() }
-    }
-
-    /**
-     * Stop the read daemon.
-     */
-    protected fun stopReadQueue() {
-        catchAll { readJobs.forEach { it.cancel() }; readJobs.clear() }
+        catchAll { writeJob?.cancel(); }
     }
 
     // endregion
@@ -89,52 +78,77 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
      */
     protected fun read(socketChannel: SocketChannel, connection: Connection) {
         try {
-            if(!socketChannel.isConnected || !socketChannel.isOpen)
-                return
-            val bytesRead = socketChannel.read(connection.readNetworkData)
-            when {
-                bytesRead < 0 -> { closeConnection(socketChannel, connection); read@return }
-                bytesRead > Packet.PACKET_METADATA_SIZE -> {
-                    connection.readNetworkData.flip()
+            while(true) {
+                if(!socketChannel.isConnected || !socketChannel.isOpen)
+                    return
 
-                    loop@ while (socketChannel.isConnected && socketChannel.isOpen && bytesRead > 0) {
-                        if(!socketChannel.isConnected || !socketChannel.isOpen)
-                            return
+                val bytesRead = socketChannel.read(connection.readNetworkData)
 
-                        val readApplicationData:ByteBuffer = NetworkBufferPool.allocate()
-                        val result = connection.packetTransportEngine.unwrap(connection.readNetworkData, readApplicationData)
-                        when (result.status) {
+                when {
+                    bytesRead < 0 -> { closeConnection(connection); read@return }
+                    bytesRead == 0 -> read@return
+                    bytesRead > Packet.PACKET_METADATA_SIZE -> {
+                        connection.readNetworkData.flip()
+
+                        loop@ while (socketChannel.isConnected && socketChannel.isOpen && bytesRead > 0) {
+                            if (!socketChannel.isConnected || !socketChannel.isOpen)
+                                return
+
+                            val readApplicationData: ByteBuffer = NetworkBufferPool.allocate()
+                            val result = connection.packetTransportEngine.unwrap(connection.readNetworkData, readApplicationData)
+                            when (result.status) {
                             // Entire Packet
-                            SSLEngineResult.Status.OK -> {
-                                readApplicationData.flip()
-                                readPacket(socketChannel, connection, readApplicationData)
-                            }
+                                SSLEngineResult.Status.OK -> {
+                                    readApplicationData.flip()
+                                    readPacket(socketChannel, connection, readApplicationData)
+                                }
                             // Partial Packet
-                            SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
-                                connection.readNetworkData.clear()
-                                NetworkBufferPool.recycle(readApplicationData)
-                                break@loop
-                            }
+                                SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
+                                    connection.readNetworkData.clear()
+                                    NetworkBufferPool.recycle(readApplicationData)
+                                    break@loop
+                                }
                             // Packet with some change
-                            SSLEngineResult.Status.BUFFER_OVERFLOW -> {
-                                connection.readNetworkData.clear()
-                                readApplicationData.flip()
-                                connection.readNetworkData.put(readApplicationData)
-                                NetworkBufferPool.recycle(readApplicationData)
-                                break@loop
+                                SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                                    connection.readNetworkData.clear()
+                                    readApplicationData.flip()
+                                    connection.readNetworkData.put(readApplicationData)
+                                    NetworkBufferPool.recycle(readApplicationData)
+                                    break@loop
+                                }
+                                SSLEngineResult.Status.CLOSED -> {
+                                    closeConnection(connection)
+                                    NetworkBufferPool.recycle(readApplicationData)
+                                    break@loop
+                                }
+                                else -> throw IllegalStateException("Invalid SSL status: " + result.status)
                             }
-                            SSLEngineResult.Status.CLOSED -> {
-                                closeConnection(socketChannel, connection)
-                                NetworkBufferPool.recycle(readApplicationData)
-                                break@loop
-                            }
-                            else -> throw IllegalStateException("Invalid SSL status: " + result.status)
                         }
                     }
                 }
             }
+
         } catch (e: IOException) {
-            closeConnection(socketChannel, connection)
+            closeConnection(connection)
+        }
+    }
+
+    protected suspend fun writeConnectionData(connection: Connection) {
+        val buffers = ArrayList<ByteBuffer>()
+        var capacity = 0
+        while(true){
+            val buffer = connection.messageChannel.writeChannel.poll() ?: break
+            capacity += buffer.limit()
+            buffers.add(buffer)
+        }
+
+        if(capacity > 0) {
+            withBuffer(BufferPool.allocateAndLimit(capacity)) { entireBuffer ->
+                buffers.forEach { entireBuffer.put(it); BufferPool.recycle(it) }
+                entireBuffer.flip()
+                while(entireBuffer.hasRemaining())
+                    connection.socketChannel.write(entireBuffer)
+            }
         }
     }
 
@@ -144,12 +158,12 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
      *
      * @since 2.0.0 Changed to refactor out the serialization from the i/o layer
      */
-    private fun readPacket(socketChannel: SocketChannel, connection: Connection, buffer: ByteBuffer) {
-        val packet = Packet(buffer)
+    private fun readPacket(socketChannel: SocketChannel, connection: Connection, networkBuffer: ByteBuffer) {
+        val packet = Packet(networkBuffer)
         // Find the message the packet belongs to
         val message = connection.messages.getOrPut(packet.messageId) {
             val message = Message(packet.messageId)
-            message.numberOfPackets = buffer.short
+            message.numberOfPackets = networkBuffer.short
             return@getOrPut message
         }
         message.packets.add(packet)
@@ -169,62 +183,22 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
     /**
      * Write a message to the socket channel
      *
-     * @param socketChannel        Socket Channel to write to
      * @param connection Connection Buffer Pool
      * @param request              Network request.
      * @since 1.2.0
      */
-    protected fun write(socketChannel: SocketChannel, connection: Connection, request: RequestToken) {
+    protected fun write(connection: Connection, request: RequestToken) {
         async {
             val buffer = serverSerializer.serialize(request, ByteBuffer.allocate(BufferPool.MEDIUM_BUFFER_SIZE))
             val message = buffer.toMessage(request)
 
-            connection.messageChannel.writeChannel.send {
-                if(socketChannel.isConnected && socketChannel.isOpen) {
-                    message.packets.forEach {
-                        writePacket(socketChannel, connection, it.packetBuffer)
-                        NetworkBufferPool.recycle(it.packetBuffer)
-                    }
-                }
+            message.packets.forEach {
+                val wrappedBuffer = NetworkBufferPool.allocate()
+                connection.packetTransportEngine.wrap(it.packetBuffer, wrappedBuffer)
+                wrappedBuffer.flip()
+                NetworkBufferPool.recycle(it.packetBuffer)
+                connection.messageChannel.writeChannel.send(wrappedBuffer)
             }
-        }
-    }
-
-    /**
-     * Write a single packet to the socket channel.
-     *
-     *
-     * This requires the packet to be less than 16kbs.  If it is larger, this will blow up.
-     *
-     * @param socketChannel        Socket Channel to write to
-     * @param connection Socket Connection
-     * @throws IOException Issue writing to the channel.
-     * @since 1.2.0
-     * @since 1.3.0 Altered to reuse write packets rather than application packet for performance
-     */
-    @Throws(IOException::class)
-    private fun writePacket(socketChannel: SocketChannel, connection: Connection, packetBuffer: ByteBuffer?) {
-
-        // My Net Data is guaranteed to only have 16k of data, so you should never get a UNDERFLOW or OVERFLOW
-        connection.writeNetworkData.clear()
-
-        // Wrap the data.  The wrapping and unwrapping determine how the packet is coded and how we know when the start
-        // and stop of the packet.  The PacketTransportEngine encapsulates that information
-        val result = connection.packetTransportEngine.wrap(packetBuffer, connection.writeNetworkData)
-
-        // Handle Wrap response
-        when (result.status) {
-            SSLEngineResult.Status.OK -> {
-                // Everything was ok.  We have a valid packet so, write it to the socket channel
-                connection.writeNetworkData.flip()
-                while (connection.writeNetworkData.hasRemaining())
-                    socketChannel.write(connection.writeNetworkData)
-            }
-            SSLEngineResult.Status.CLOSED -> {
-                closeConnection(socketChannel, connection)
-                return
-            }
-            else -> throw IllegalStateException("Invalid SSL status: " + result.status)
         }
     }
 
@@ -281,7 +255,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
                             readHandshakeData.compact()
                             handshakeStatus = result.handshakeStatus
                         } catch (sslException: SSLException) {
-                            closeConnection(socketChannel, connection)
+                            closeConnection(connection)
                             break@loop
                         }
 
@@ -292,7 +266,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
                             SSLEngineResult.Status.CLOSED -> if (connection.packetTransportEngine.isOutboundDone) {
                                 return false
                             } else {
-                                closeConnection(socketChannel, connection)
+                                closeConnection(connection)
                                 break@loop
                             }
                             else -> throw IllegalStateException("Invalid SSL status: " + result.status)
@@ -304,7 +278,7 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
                             result = connection.packetTransportEngine.wrap(writeHandshakeApplicationBuffer, writeHandshakeBuffer)
                             handshakeStatus = result.handshakeStatus
                         } catch (sslException: SSLException) {
-                            closeConnection(socketChannel, connection)
+                            closeConnection(connection)
                             break@loop
                         }
 
@@ -355,12 +329,12 @@ abstract class AbstractNetworkPeer : AbstractSSLPeer() {
      * @param connection Buffer information.
      * @throws IOException General IO Exception
      */
-    protected fun closeConnection(socketChannel: SocketChannel, connection: Connection) {
+    open protected fun closeConnection(connection: Connection) {
         connection.isAuthenticated = false
         catchAll { ConnectionFactory.recycle(connection) }
         catchAll { connection.packetTransportEngine.closeInbound() }
         catchAll { connection.packetTransportEngine.closeOutbound() }
-        catchAll { socketChannel.close() }
+        catchAll { connection.socketChannel.close() }
     }
 
     // endregion

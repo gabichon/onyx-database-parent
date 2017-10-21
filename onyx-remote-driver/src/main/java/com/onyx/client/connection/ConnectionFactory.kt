@@ -3,6 +3,7 @@ package com.onyx.client.connection
 import com.onyx.buffer.NetworkBufferPool
 import com.onyx.client.base.Connection
 import com.onyx.client.base.engine.PacketTransportEngine
+import java.nio.channels.SocketChannel
 
 object ConnectionFactory {
 
@@ -15,7 +16,7 @@ object ConnectionFactory {
     }
 
     @Synchronized
-    fun create(engine: PacketTransportEngine, channel: UnifiedMessageChannel = UnifiedMessageChannel()): Connection = Connection(engine, channel)
+    fun create(socketChannel: SocketChannel, engine: PacketTransportEngine, channel: UnifiedMessageChannel = UnifiedMessageChannel()): Connection = Connection(engine, channel, socketChannel)
 
 }
 

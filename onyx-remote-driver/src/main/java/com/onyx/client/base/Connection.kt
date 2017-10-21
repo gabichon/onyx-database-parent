@@ -6,6 +6,7 @@ import com.onyx.client.Message
 import com.onyx.client.base.engine.PacketTransportEngine
 import com.onyx.client.connection.UnifiedMessageChannel
 import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
 
 /**
  * Created by tosborn1 on 2/12/17.
@@ -18,7 +19,7 @@ class Connection(
 
         var packetTransportEngine: PacketTransportEngine,
         var messageChannel: UnifiedMessageChannel,
-        var writeNetworkData: ByteBuffer = BufferPool.allocateAndLimit(NetworkBufferPool.bufferSize),
+        var socketChannel:SocketChannel,
         var readNetworkData: ByteBuffer = BufferPool.allocateAndLimit(NetworkBufferPool.bufferSize)) {
 
     var isAuthenticated = false
